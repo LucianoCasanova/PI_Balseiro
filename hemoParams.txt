@@ -1,0 +1,323 @@
+Quiero medir tres cosas: Ploss, %WSS y el HFD.
+
+Si modificás código fuente y lo querés compilar, entrás al apptainer
+
+    apptainer shell -w $NOMBRE$
+
+Con el -w permitiendo escribir.
+
+Te parás en el directorio que cambiaste y en la consola:
+
+    wmake
+
+Con esto deberías estar.
+
+===========================================================Ploss=================================================================
+
+Para Ploss no modifico código fuente. Calculo los caudales con:
+
+    postProcess -func "patchFlowRate(patch=IVC)"
+    postProcess -func "patchFlowRate(patch=SVC)"
+    postProcess -func "patchFlowRate(patch=RPA)"
+    postProcess -func "patchFlowRate(patch=LPA)"
+
+// Te lo guarda en $CASE/postProcessing con ese nombre horrendo, debe haber alguna forma de mejorar eso.
+
+En $CASE/system/controlDict, dentro de functions tengo comentado un functionObject:
+
+    totalPressure{
+        type    pressure;
+        libs    ("libfieldFunctionObjects.so");
+        mode    total;
+        pRef    0; //No me queda claro esto, de todas formas para el cálculo no importa una presión flotada en todos los términos
+        calcTotal   yes;
+        calcCoeff   no;
+    }
+
+Una vez corrida la simulación lo descomento y lo corro escribiendo en consola:
+
+    pimpleFoam -postProcess
+
+Esto me crea un archivo total(p) en cada directorio de tiempo. Yo necesito el promedio en los patches de inlet y outlet:
+
+    postProcess -func "patchAverage(total(p),name=IVC,patch=IVC)"
+    postProcess -func "patchAverage(total(p),name=SVC,patch=SVC)"
+    postProcess -func "patchAverage(total(p),name=RPA,patch=RPA)"
+    postProcess -func "patchAverage(total(p),name=LPA,patch=LPA)"
+
+Con un código en python calculo bien el Ploss.
+
+===========================================================%WSS==================================================================
+
+Para esto sí modifico código fuente, en particular $FOAM_SRC/functionObjects/field/wallShearStress/wallShearStress.C.
+
+Te estarás preguntando por qué hay que cambiar algo si OpenFOAM ya tiene una función de posprocesado que te calcula el wss.
+
+Bueno, lo que calcula OF es el vector tension, no la componente tangencial a la pared. Esta metida la componente normal que
+no nos interesa.
+
+Lo que hice fue modificar la funcion calcShearStress, aviso que está desprolijo y no es lo óptimo, pero sirve para lo que 
+quiero.
+
+    Foam::tmp<Foam::volVectorField> Foam::functionObjects::wallShearStress::calcShearStress(const volSymmTensorField& tau)
+    {
+        tmp<volVectorField> twallShearStress(
+            volVectorField::New(
+                type(),
+                mesh_,
+                dimensionedVector(tau.dimensions(), Zero)
+            )
+        );
+
+        volVectorField::Boundary& wallShearStressBf = twallShearStress.ref().boundaryFieldRef();
+
+        forAllConstIter(labelHashSet, patchSet_, iter)
+        {
+            label patchi = iter.key();
+
+            const vectorField& Sfp = mesh_.Sf().boundaryField()[patchi]; //Normal vector with magnitude
+            const scalarField& magSfp = mesh_.magSf().boundaryField()[patchi]; //Normal vector magnitude
+
+            //Hasta acá va idéntico
+
+            vectorField miTau = (-Sfp/magSfp) & tau.boundaryField()[patchi]; //tau vector, el que normalmente te entrega OF
+
+            scalarField sigma = Sfp/magSfp & miTau; //Normal component of tau
+
+            scalarField tauTang = sqrt(mag(miTau)*mag(miTau)-sigma*sigma); //Magnitude of proyection of tau in the plane
+
+            vectorField tauTangVec(tauTang.size(), vector::zero); // Inicializa tauTangVec con ceros
+
+            forAll(tauTang, i) // Recorre todos los elementos de tauTang
+            {
+                tauTangVec[i].x() = tauTang[i]; // Asigna el valor de tauTang al x del vector correspondiente en tauTangVec
+            }
+
+            wallShearStressBf[patchi] = tauTangVec; // Assign the tangential component to the wallShearStressBf
+        }
+
+        return twallShearStress;
+    }
+
+//Sería mejor que la función devolviera un volScalarField y no tener que hacer eso del vector de ceros. Lo intenté, dió error 
+//decidí dejarlo así.
+
+Bien, una vez corrida la simulación corres en consola:
+
+    pimpleFoam -postProcess -func wallShearStress
+
+Esto te crea un archivo wallShearStress en cada directorio de tiempo. De acá lo que hice fue copiar todos estos con un 
+programita de Bash y seguir procesándolo con Python.
+
+//TODO Si lo que me interesa es sólo en cierta zona de la TCPC, se podría agregar un if en wallShearStress.C para delimitar 
+//el cálculo a una cajita y no todo el dominio. No es lo más elegante ni general, no se me ocurre otra forma por ahora. Lo 
+//mejor sería poder vincular cada entrada del archivo wallShearStress con una celda/cara (donde sea que lo calcule) y poder
+//tener el (x,y,z) de cada dato. Después haces los ifs en Python y te olvidás.
+
+===========================================================HFD===================================================================
+
+Para esto también modifico código fuente, en particular $FOAM_APP/solvers/incompressible/pimpleFoam.
+
+En pimpleFoam.C, agrego
+
+    #include "SEqn.H"
+
+en la línea anterior a
+
+    runTime.write();
+
+En createFields.H, agrego
+
+    Info<< "Reading field s\n" << endl;
+    volScalarField s
+    (
+        IOobject
+        (
+            "s",
+            runTime.timeName(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh
+    );
+
+entre p y U, aunque no importa el orden la verdad. "s" es el escalar pasivo que, si querés, representa los nutrientes hepáticos.
+
+Por último, creo un archivo SEqn.H, que contiene
+
+    {
+        fvScalarMatrix SEqn
+        (
+            fvm::ddt(s)
+        + fvm::div(phi, s)
+        );
+
+        SEqn.relax();
+
+        SEqn.solve();
+
+    }
+
+No le puse difusión, pero tener en cuenta que puede haber difusión numérica si no se tiene cuidado con los schemes (creo).
+
+En tu caso, tenés que hacer un par de cosas. En primer lugar, en $CASE/0 tenes que crear un archivo s, por ejemplo:
+
+    /*--------------------------------*- C++ -*----------------------------------*\
+    =========                 |
+    \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+    \\    /   O peration     | Website:  https://openfoam.org
+        \\  /    A nd           | Version:  10
+        \\/     M anipulation  |
+    \*---------------------------------------------------------------------------*/
+    FoamFile
+    {
+        format      ascii;
+        class       volScalarField;
+        object      s;
+    }
+    // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+    dimensions      [0 0 0 0 0 0 0];
+
+    internalField   uniform 0;
+
+    boundaryField
+    {
+        IVC
+        {
+            type            fixedValue;
+            value           uniform 1;
+        }
+
+        RPA
+        {
+            type            zeroGradient;
+        }
+
+        SVC
+        {
+            type            fixedValue;
+            value           uniform 0;
+        }
+
+        LPA
+        {
+            type            zeroGradient;
+        }
+
+        walls
+        {
+            type            zeroGradient;
+        }
+    }
+    // ************************************************************************* //
+
+El valor no es importante, va a imponer algún flujo de s dependiendo de como sea el perfil de U a la entrada. Después la
+idea es dividir el flujo_RPA o flujo_LPA sobre flujo_IVC.
+
+Después en $CASE/system/fvSolution agrego s, yo lo que hice fue sumarlo a "(U|k|epsilon)", quedando "(U|k|epsilon|s)".
+
+En $CASE/system/schemes agrego 
+
+    div(phi,s)          Gauss linearUpwind grad(s);
+
+en divSchemes. (El functionObject de scalarTransport tiene de default el scheme de U, así recomendaría copiar el de U).
+
+Con eso al correr ya debería crearse un archivo s en cada directorio temporal.
+
+Por último, en $CASE/system/controlDict agrego en functions lo siguiente:
+
+    fluxS_RPA
+    {
+        type                surfaceFieldValue;
+        libs                ("libfieldFunctionObjects.so");
+
+        writeControl        timeStep;
+        writeInterval       1;
+        writeFields         true;
+        writeArea	        true;
+        log                 false;
+        surfaceFormat       none;
+
+        regionType          patch;
+        name                RPA;
+
+        operation           areaNormalIntegrate;
+        weightField         s;
+        fields              (U);
+    }
+
+    fluxS_LPA
+    {
+        type                surfaceFieldValue;
+        libs                ("libfieldFunctionObjects.so");
+
+        writeControl        timeStep;
+        writeInterval       1;
+        writeFields         true;
+        writeArea	        true;
+        log                 false;
+        surfaceFormat       none;
+
+        regionType          patch;
+        name                LPA;
+
+        operation           areaNormalIntegrate;
+        weightField         s;
+        fields              (U);
+    }
+
+    fluxS_IVC
+    {
+        type                surfaceFieldValue;
+        libs                ("libfieldFunctionObjects.so");
+
+        writeControl        timeStep;
+        writeInterval       1;
+        writeFields         true;
+        writeArea	        true;
+        log                 false;
+        surfaceFormat       none;
+
+        regionType          patch;
+        name                IVC;
+
+        operation           areaNormalIntegrate;
+        weightField         s;
+        fields              (U);
+    }
+
+Al hacer areaNormalIntegrate de U con pesos s estamos calculando el flujo de s en los patchs (se puede corroborar en el código
+fuente de areaNormalIntegrate).
+
+Al correr esto con 
+
+    pimpleFoam -postProcess 
+
+se crean en $CASE/postProcessing tres directorios. Tomo los datos de estos directorios y los proceso en Python.
+
+
+============================================================FAILS================================================================
+
+Para HFD al principio había intentado usar el functionObject scalarTransport, agregando en controlDict/functions:
+
+    HFD                                                         
+    {   
+            type            scalarTransport;
+            libs            ("libsolverFunctionObjects.so");
+
+             field           s;  
+             schemesField    U;
+             writeControl   outputTime;  
+             diffusion      none;
+    }
+
+Esto anda bien (tiene que estar descomentado cuando se corre el solver) pero cuando intento calcular los flujos me encuentro con 
+que s "vive" dentro del entorno del functionObject, OF no lo puede encontrar. Lo que hice fue agregarlo en el createFields.H como
+mostré arriba. Esto hace dos cosas:
+
+1) Permite a los functionObjects surfaceFieldValue encontrar a s y calcular bien los flujos.
+2) No te deja volver a correr el functionObject scalarTransport. Si lo intentás, en cada directorio temporal el archivo s va a ser
+    idéntico al de 0. Así que una opción era ir compilando y descompilando el createFields o modificar el pimpleFoam y no tener que
+    volver a preocuparme.
